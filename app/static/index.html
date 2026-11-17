@@ -29,6 +29,9 @@
   .badge.STREAMING { background:#dafbe1; color:var(--ok); }
   .badge.INITIALIZING { background:#fff8c5; color:var(--warn); }
   .badge.ERROR { background:#ffebe9; color:var(--err); }
+  .badge.PENDING { background:#fff8c5; color:var(--warn); }
+  .badge.SENT { background:#dafbe1; color:var(--ok); }
+  .badge.FAILED { background:#ffebe9; color:var(--err); }
   .muted { color:#656d76; font-size:12px; }
   .msg { margin-top:8px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
@@ -80,6 +83,40 @@
       <button onclick="loadHistory()">查询</button>
     </div>
     <div id="hist-wrap" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 逐事务投递状态（事务性发件箱，按提交顺序，未确认不越过）</h2>
+    <div class="kv" id="notif-stats" style="margin-bottom:10px;"><div class="muted">加载中…</div></div>
+    <table>
+      <thead><tr><th>顺序</th><th>状态</th><th>源事务 xid</th><th>提交点 LSN</th>
+        <th>尝试次数</th><th>制品编号（整笔增删改）</th><th>最近错误</th><th>更新时间</th><th>操作</th></tr></thead>
+      <tbody id="notifs"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card full">
+    <h2>⑥ 接收端待重建制品编号（幂等：重发只安排一次重建）</h2>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button onclick="loadReceiver()">刷新接收端</button>
+      <button class="primary" onclick="drainReceiver()">模拟执行重建（清空待重建队列）</button>
+      <span id="recv-msg" class="msg"></span>
+    </div>
+    <div style="margin-top:10px;">
+      <h3 style="font-size:13px;margin:6px 0;">待重建队列</h3>
+      <table><thead><tr><th>制品编号</th><th>入队时间</th><th>触发通知 seq</th></tr></thead>
+        <tbody id="recv-pending"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody></table>
+    </div>
+    <div style="margin-top:10px;">
+      <h3 style="font-size:13px;margin:6px 0;">已处理通知账本（重复投递计数应与重发次数一致，且不产生重复重建）</h3>
+      <table><thead><tr><th>seq</th><th>xid</th><th>提交点 LSN</th><th>重复投递次数</th><th>首次到达</th><th>最近到达</th></tr></thead>
+        <tbody id="recv-processed"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table>
+    </div>
+    <div style="margin-top:10px;">
+      <h3 style="font-size:13px;margin:6px 0;">重建历史</h3>
+      <table><thead><tr><th>#</th><th>制品编号</th><th>触发 seq</th><th>重建时间</th></tr></thead>
+        <tbody id="recv-history"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
+    </div>
   </section>
 </main>
 
@@ -214,8 +251,102 @@ async function loadHistory(){
 
 addOp('insert');
 refreshProgress(); refreshPoints();
+refreshNotifications(); loadReceiver();
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
+setInterval(refreshNotifications, 3000);
+setInterval(loadReceiver, 5000);
+
+// ----------------------------------------------------------- 通知投递状态
+async function refreshNotifications(){
+  const tb = document.getElementById('notifs');
+  const statsEl = document.getElementById('notif-stats');
+  try {
+    const r = await getJSON('/api/notifications');
+    const s = r.stats || {};
+    statsEl.innerHTML = `
+      <div>接收端</div><div><code>${esc(r.receiver_url ?? '-')}</code></div>
+      <div>通知总数</div><div>${s.total ?? 0}</div>
+      <div>已确认 SENT</div><div>${s.SENT ?? 0}</div>
+      <div>待投 PENDING</div><div>${s.PENDING ?? 0}</div>
+      <div>失败重试 FAILED</div><div>${s.FAILED ?? 0}</div>`;
+    if (!r.notifications.length) {
+      tb.innerHTML='<tr><td colspan="9" class="muted">暂无通知（提交含制品变更的源事务后出现）</td></tr>';
+      return;
+    }
+    tb.innerHTML = r.notifications.map(n => {
+      const nos = (n.payload?.changes || []).map(c =>
+        `<span class="tag ${esc(c.op)}">${esc(c.op)} #${c.artifact_no}</span>`).join(' ');
+      const btn = n.status === 'SENT' ? '<span class="muted">已确认</span>'
+        : `<button onclick="retryNotif(${n.id})">立即重试</button>`;
+      return `<tr>
+        <td>${n.seq}</td>
+        <td><span class="badge ${esc(n.status)}">${esc(n.status)}</span></td>
+        <td>${n.xid}</td>
+        <td><code>${esc(n.commit_lsn)}</code></td>
+        <td>${n.attempts}</td>
+        <td>${nos || '<span class="muted">无目标表变更</span>'}</td>
+        <td>${n.last_error ? '<span style="color:var(--err)">'+esc(n.last_error)+'</span>' : '—'}</td>
+        <td class="muted">${esc(n.updated_at ?? '—')}</td>
+        <td>${btn}</td></tr>`;
+    }).join('');
+  } catch(e){
+    tb.innerHTML = `<tr><td colspan="9" class="msg err">${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function retryNotif(id){
+  try {
+    await getJSON('/api/notifications/'+id+'/retry', {method:'POST'});
+    refreshNotifications();
+  } catch(e){ alert('重试失败：'+e.message); }
+}
+
+// ----------------------------------------------------------- 接收端状态
+async function loadReceiver(){
+  try {
+    const [p, h, d] = await Promise.all([
+      getJSON('/api/receiver/pending'),
+      getJSON('/api/receiver/processed'),
+      getJSON('/api/receiver/history'),
+    ]);
+    document.getElementById('recv-pending').innerHTML = p.pending.length
+      ? p.pending.map(x => `<tr><td>${x.artifact_no}</td><td class="muted">${esc(x.enqueued_at)}</td>
+          <td>${(x.reasons||[]).map(seq=>'#'+seq).join(', ')}</td></tr>`).join('')
+      : '<tr><td colspan="3" class="muted">队列为空</td></tr>';
+    document.getElementById('recv-processed').innerHTML = d2rows(d.processed, 6,
+      x => `<td>${x.notification_seq}</td><td>${x.xid}</td><td><code>${esc(x.commit_lsn)}</code></td>
+            <td>${x.duplicate_count}</td><td class="muted">${esc(x.first_seen_at)}</td>
+            <td class="muted">${esc(x.last_seen_at)}</td>`);
+    document.getElementById('recv-history').innerHTML = d2rows(h.history, 4,
+      x => `<td>${x.id}</td><td>${x.artifact_no}</td>
+            <td>${(x.trigger_seqs||[]).map(seq=>'#'+seq).join(', ')}</td>
+            <td class="muted">${esc(x.rebuilt_at)}</td>`);
+    document.getElementById('recv-msg').textContent = '';
+  } catch(e){
+    for (const id of ['recv-pending','recv-processed','recv-history']) {
+      const cols = id==='recv-history' ? 4 : (id==='recv-pending' ? 3 : 6);
+      document.getElementById(id).innerHTML =
+        `<tr><td colspan="${cols}" class="msg err">${esc(e.message)}</td></tr>`;
+    }
+  }
+}
+function d2rows(rows, cols, fn){
+  return rows.length ? rows.map(fn).join('')
+    : `<tr><td colspan="${cols}" class="muted">暂无记录</td></tr>`;
+}
+async function drainReceiver(){
+  try {
+    const r = await getJSON('/api/receiver/drain', {method:'POST'});
+    document.getElementById('recv-msg').textContent =
+      '已重建 ' + (r.rebuilt||[]).length + ' 个编号：' + (r.rebuilt||[]).join(', ');
+    document.getElementById('recv-msg').className = 'msg ok';
+    loadReceiver();
+  } catch(e){
+    document.getElementById('recv-msg').textContent = '重建失败：'+e.message;
+    document.getElementById('recv-msg').className = 'msg err';
+  }
+}
 </script>
 </body>
 </html>

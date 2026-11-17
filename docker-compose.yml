@@ -24,10 +24,30 @@ services:
       timeout: 3s
       retries: 20
 
+  receiver:
+    build: .
+    command: ["python", "-m", "app.receiver.server"]
+    environment:
+      RECEIVER_HOST: "0.0.0.0"
+      RECEIVER_PORT: "8090"
+      RECEIVER_DB: "/data/receiver.db"
+    ports:
+      - "8090:8090"
+    volumes:
+      - receiverdata:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
   app:
     build: .
     depends_on:
       postgres:
+        condition: service_healthy
+      receiver:
         condition: service_healthy
     environment:
       PG_DSN: "host=postgres port=5432 dbname=postgres user=postgres password=postgres"
@@ -35,6 +55,7 @@ services:
       REPLICATION_SLOT: "artifacts_history_slot"
       SOURCE_TABLE: "artifacts"
       WEB_PORT: "8000"
+      NOTIFIER_URL: "http://receiver:8090/notify"
     ports:
       - "8000:8000"
     volumes:
@@ -44,3 +65,4 @@ services:
 volumes:
   pgdata:
   historydata:
+  receiverdata:

@@ -34,6 +34,15 @@ class Settings:
     status_interval_s: int = int(_env("REPL_STATUS_INTERVAL_S", "5"))
     reconnect_backoff_s: int = int(_env("REPL_RECONNECT_BACKOFF_S", "2"))
 
+    # ---- 逐事务可靠通知（事务性发件箱 → 固定接收端）----
+    notifier_url: str = _env(
+        "NOTIFIER_URL", "http://127.0.0.1:8090/notify"
+    )
+    notifier_timeout_s: float = float(_env("NOTIFIER_TIMEOUT_S", "5"))
+    notifier_poll_s: float = float(_env("NOTIFIER_POLL_S", "1"))
+    notifier_backoff_s: float = float(_env("NOTIFIER_BACKOFF_S", "2"))
+    notifier_max_backoff_s: float = float(_env("NOTIFIER_MAX_BACKOFF_S", "60"))
+
     # ---- 服务 ----
     host: str = _env("WEB_HOST", "0.0.0.0")
     port: int = int(_env("WEB_PORT", "8000"))

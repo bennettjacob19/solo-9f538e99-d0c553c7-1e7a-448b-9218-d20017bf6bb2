@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .capture import CaptureWorker
 from .config import settings
+from .notifier import NotifierWorker
 from .source import SourceDB, SourceError
 from .storage import HistoryStore, lsn_to_num
 
@@ -74,16 +76,19 @@ class BatchRequest(BaseModel):
 
 store = HistoryStore(settings.sqlite_path)
 source = SourceDB(settings)
-worker = CaptureWorker(store, source, settings)
+notifier = NotifierWorker(store, settings)
+worker = CaptureWorker(store, source, settings, notifier=notifier)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    notifier.start()
     worker.start()
     try:
         yield
     finally:
         worker.stop()
+        notifier.stop()
         store.close()
 
 
@@ -176,3 +181,99 @@ def api_artifact_history(artifact_no: int) -> dict:
         "artifact_no": artifact_no,
         "history": store.get_history_of(artifact_no),
     }
+
+
+# ------------------------------------------------------------- 通知发件箱
+@app.get("/api/notifications")
+def api_notifications() -> dict:
+    """逐笔投递状态（初始化期也可查看，发件箱不依赖历史开放状态）。"""
+    return {
+        "stats": store.notification_stats(),
+        "notifications": store.list_notifications(),
+        "receiver_url": settings.notifier_url,
+    }
+
+
+@app.post("/api/notifications/{notification_id}/retry")
+def api_retry_notification(notification_id: int) -> dict:
+    """手动重试一笔未确认通知：清空退避并立即唤醒通知线程。"""
+    item = store.get_notification(notification_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="通知不存在")
+    if item["status"] == "SENT":
+        raise HTTPException(status_code=409, detail="该通知已确认，无需重试")
+    ok = store.rearm_notification(notification_id)
+    notifier.kick()
+    return {"rearmed": ok, "notification": store.get_notification(notification_id)}
+
+
+# ------------------------------------------------- 接收端待重建编号（代理）
+def _receiver_base_url() -> str:
+    # NOTIFIER_URL 形如 http://receiver:8090/notify，去掉尾部 /notify
+    return settings.notifier_url.rsplit("/", 1)[0]
+
+
+@app.get("/api/receiver/pending")
+def api_receiver_pending() -> JSONResponse:
+    """接收端当前待重建的制品编号。"""
+    return _receiver_get("/receiver/pending")
+
+
+@app.get("/api/receiver/history")
+def api_receiver_history() -> JSONResponse:
+    return _receiver_get("/receiver/history")
+
+
+@app.get("/api/receiver/processed")
+def api_receiver_processed() -> JSONResponse:
+    return _receiver_get("/receiver/processed")
+
+
+@app.post("/api/receiver/drain")
+def api_receiver_drain() -> JSONResponse:
+    """演示操作：接收端执行一次重建，待重建编号转入历史。"""
+    return _receiver_post("/receiver/drain", b"")
+
+
+def _receiver_get(path: str) -> JSONResponse:
+    import urllib.error
+    import urllib.request
+
+    url = _receiver_base_url() + path
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, method="GET"),
+            timeout=settings.notifier_timeout_s,
+        ) as resp:
+            return JSONResponse(json.loads(resp.read().decode("utf-8")))
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"接收端返回 {exc.code}: {exc.read().decode('utf-8', 'replace')}",
+        )
+    except Exception as exc:
+        # 接收端暂不可用不影响本服务的历史查询，只在该接口上报
+        raise HTTPException(status_code=503, detail=f"接收端暂不可用: {exc}")
+
+
+def _receiver_post(path: str, body: bytes) -> JSONResponse:
+    import urllib.error
+    import urllib.request
+
+    url = _receiver_base_url() + path
+    try:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(
+            req, timeout=settings.notifier_timeout_s
+        ) as resp:
+            return JSONResponse(json.loads(resp.read().decode("utf-8")))
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"接收端返回 {exc.code}: {exc.read().decode('utf-8', 'replace')}",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"接收端暂不可用: {exc}")

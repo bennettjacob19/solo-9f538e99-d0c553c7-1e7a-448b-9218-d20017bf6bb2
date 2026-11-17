@@ -30,10 +30,11 @@ log = logging.getLogger("capture")
 
 class CaptureWorker:
     def __init__(self, store: HistoryStore, source: SourceDB,
-                 settings: Settings) -> None:
+                 settings: Settings, notifier: Any | None = None) -> None:
         self._store = store
         self._source = source
         self._settings = settings
+        self._notifier = notifier
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_xid: int | None = None
@@ -254,6 +255,10 @@ class CaptureWorker:
                 "txn %s persisted at %s with %d change(s)",
                 xid, lsn_text, len(changes),
             )
+            # 通知已与事务同事务落盘进 outbox：唤醒通知线程按序投递。
+            # 重放事务（written=False）不会产生新通知，无需唤醒。
+            if self._notifier is not None and changes:
+                self._notifier.notify_new_data()
         else:
             log.info("txn %s replayed after restart, skipped (idempotent)", xid)
 
